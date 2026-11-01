@@ -1,0 +1,7 @@
+{
+	"install": "npm install",
+	"excludes": ["node_modules", ".git", "dist", "out", "release", ".deskport/trigger.json"],
+	"targets": {
+		"dev": { "label": "Digby (dev)", "command": "npm run dev", "cwd": "." }
+	}
+}
