@@ -12,7 +12,7 @@
 	"bugs": { "url": "https://github.com/CLDMV/digby/issues" },
 	"homepage": "https://github.com/CLDMV/digby#readme",
 	"main": "src/app.mjs",
-	"dependencies": { "@cldmv/rummage": "^0.1.359" },
+	"dependencies": { "@cldmv/rummage": "workspace:*" },
 	"devDependencies": { "electron": ">=42", "electron-builder": "^26.0.0" },
 	"scripts": {
 		"start": "electron .",
