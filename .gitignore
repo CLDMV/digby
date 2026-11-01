@@ -1,0 +1,11 @@
+node_modules/
+dist/
+out/
+*.log
+.DS_Store
+.deskport/trigger.json
+tmp/
+coverage/
+.env
+.env.*
+!.env.example
