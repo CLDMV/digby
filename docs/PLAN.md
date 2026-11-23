@@ -172,7 +172,7 @@ The switch is one action in the `networks` orchestrator (plan, approve, apply, w
 
 Digby gets its **own LAN address `10.0.1.166`** (**decided**, Q1): a second address on `eno1`, added to the NetworkManager connection (`nmcli con mod "Wired connection 1" +ipv4.addresses 10.0.1.166/23`, then `nmcli con up`, a brief blip), and reserved in UniFi (a fixed IP or reservation) so DHCP never hands it out; `.166` answers no ARP or ping today. Host 01 keeps `10.0.1.165` for traefik, Quack, Hoot and Jellytagger; their records keep pointing at `.165`. In the long run, adding an address to the box belongs to Digby's `networks` orchestrator and its UniFi driver (§4.10), not to a hand-typed command.
 
-Because Technitium and traefik both bind every address today, Digby cannot bind `.166:53` until Technitium stops (it goes away at cutover, §10) and cannot bind `.166:443` until the traefik container's port bindings are narrowed to `10.0.1.165` and `100.64.178.0` (plus the IPv6 addresses if they are used) in Portainer (a step for the operator; §10 Phase 0). Digby's listeners are configured for their addresses ahead of time and bind when the port frees (`retryBind`, G1), so the gap between Technitium stopping and Digby answering is under a second.
+Because Technitium and traefik both bind every address today, Digby cannot bind `.166:53` until Technitium stops (it goes away at cutover, §10) and cannot bind `.166:443` until the traefik container's port bindings are narrowed to `10.0.1.165` and `100.64.178.0` (plus the IPv6 addresses if they are used) in Portainer (a step for the operator; §10 Phase 0). The narrowing is interim: Digby replaces traefik with its own proxy (§6.18, slice 3b), and traefik is removed once the proxy reaches parity (§10 Phase 6). Digby's listeners are configured for their addresses ahead of time and bind when the port frees (`retryBind`, G1), so the gap between Technitium stopping and Digby answering is under a second.
 
 After cutover Digby also listens on `10.0.1.165:53` as a straggler listener, so anything still pointing there keeps working and shows in the logs with its source address.
 
@@ -308,9 +308,10 @@ Few dependencies pinned by lockfile; `rummage build --dependencies lockfile`; `n
 | **UniFi and Tailscale become drivers of `networks`**, on standalone libraries: `digby-ext-networks-driver-unifi` (on `@cldmv/lib-unifi`) and `digby-ext-networks-driver-tailscale` (on `@cldmv/lib-tailscale`). `digby-ext-machines-driver-tailscale` is retired. Vendor specifics (Forward Domain rules, DHCP DNS settings, split routes, ACLs, Override, MagicDNS, shared-in nodes) stay inside the drivers; their checks surface through `health`. | The third-party API belongs in a library any CLDMV project can use; the rummage-specific part belongs in the driver; the policy, records, audit and UI belong in the orchestrator |
 | **`machines` owns no drivers.** It takes its device sources from the networks drivers through the orchestrator. | One inventory, one place to plug a vendor in |
 | **`health` is added**: the operational to-do (mode, listeners, UniFi, Tailscale, clock, certificates, replication), each finding with fix steps, staying until its check passes. | Every integration raises findings; one place shows them |
+| **`proxy` is added** (Q25): the reverse proxy that replaces traefik, with per-source allow lists shared with views (§6.18). | Digby already owns the names, the views and the certificates; one list gating both DNS and HTTP can't drift |
 | `public` and `public-driver-route53` stay but move later; `blocking`, `dnssec`, `transfer`, `cluster`, `dhcp` are later slices. | Q3, Q5, the mode model |
 
-The extensions: `server`, `zones`, `views`, `resolver`, `logs`, `health`, `networks`, `networks-driver-unifi`, `networks-driver-tailscale`, `machines`, `public`, `public-driver-route53`, `cluster`, `dnssec`, `transfer`, `blocking`, `dhcp` (seventeen) plus the `digby` app; the libraries `lib-unifi`, `lib-tailscale`, `lib-route53`.
+The extensions: `server`, `zones`, `views`, `resolver`, `logs`, `health`, `networks`, `networks-driver-unifi`, `networks-driver-tailscale`, `machines`, `public`, `public-driver-route53`, `cluster`, `dnssec`, `transfer`, `blocking`, `dhcp`, `proxy` (eighteen) plus the `digby` app; the libraries `lib-unifi`, `lib-tailscale`, `lib-route53`.
 
 Conventions shared by all of them: the sectional layout (`src/api/<slug>/`, `src/view/<slug>/`, `src/lib/`, `sql/`), leaf names by directory nesting (`self.zones.record.set`, never camelCase), `platforms: ["web"]`, `requires` listing the rummage packages each builds on, record types as global lowercase hyphenated names with `scope: "org"` and `history: "all"`, manifest `public` / `symbols` / `permissions` / `emits` / `subscribes`, an `operations` contribution (the MCP tools and REST endpoints the extension or driver owns, §6.17; a driver contributes reads only, every write goes through its orchestrator), a `docs/<slug>.md` on the rummage template, and `tests/*.test.vitest.mjs` composed through `composeTestHost`.
 
@@ -378,7 +379,9 @@ Read scopes and write scopes are separate clients or separately granted; the lib
 
 **Records.** `view` (`name`, `order`, `match { sources[], listeners[], networks[] (refs into `networks`, mode 2), default }`, `recursion`, `transfers`, `blocking`, `description`); seeded `lan`, `tailnet`, `public` (default, recursion refused).
 
-**Leaves.** `self.views.list`, `self.views.classify({ client, listener })` (tester only), `self.views.compile()`. **UI.** ordered list, CIDR editor with overlaps, "who am I" tester. **Permissions.** `digby.views.edit`.
+**Allow lists** (slice 3b, #47/#48). A view (or a source or listener rule inside it) can carry a name allow list with wildcards (`*.test.homelab.cldmv.net`). The list is the one source of truth for both sides: `server` answers NXDOMAIN (or REFUSED, per view) for a name outside it, the zone wildcard included, and the proxy (§6.18) refuses the same names at the handshake. A name can therefore never be resolvable but blocked at the proxy, or the other way round. Pods behind k3s CoreDNS reach Digby as CoreDNS's address, so they get a dedicated listener classified into its own view; the same listener idea gives the LLM server's pods a different list than its host, which shares their tailnet address.
+
+**Leaves.** `self.views.list`, `self.views.classify({ client, listener })` (tester only), `self.views.compile()`, `self.views.allowed({ view, name })` (used by `server` and `proxy`). **UI.** ordered list, CIDR editor with overlaps, "who am I" tester. **Permissions.** `digby.views.edit`.
 
 ### 6.6 `digby-ext-resolver`
 
@@ -515,6 +518,17 @@ Every operation is declared once in its owner's manifest (G13) and served both a
 | rummage's own | `certificates_list` (`rummage-ext-tls`, 3), the updater's `updates_status`, the MCP admin tab's operations: the framework's, not Digby's | — |
 
 Internal leaves are never exposed by accident: an operation names exactly one leaf of its owner, and the registry refuses a leaf outside the owner's placement roots, as `mcp/tools` does today.
+
+### 6.18 `digby-ext-proxy` — the front door (slice 3b, #49)
+
+Digby replaces traefik as the reverse proxy on 01 (**decided**, Q25). The proxy holds 80 and 443 on every address once traefik is gone: TLS with the certificates Digby already owns (§11), served from rummage secrets in process, so the proxy needs no exported key file; port 80 redirects to HTTPS and answers ACME HTTP-01 if a non-wildcard name ever needs it.
+
+- **Routes.** `proxy-route` (`host` with wildcards, `backend { host, port, scheme }`, `listeners[]`, `headers`, `websocket`, `source` ∈ `manual`/`deploy`), replacing traefik's per-instance files under `/srv/traefik/dynamic`. Routes for rummage apps are kept current from what `rummage deploy` reports (instance added, port changed, instance removed) (#46); everything else is a hand-made route in the UI. Backends stay on Docker-only or loopback ports.
+- **Allow lists** (#47). The per-source list from views (§6.5) gates every request: the TLS server name and the Host header must both be on the list and must agree; anything else is refused at the handshake, or with 421 (mismatch) or 403 (not allowed), and never reaches a backend. A source with a list is default-deny, and every refusal is logged with the source and the requested name.
+- **Admin UI and DoH** become routes on the proxy (`digby.homelab.cldmv.net` → the admin listener, `/dns-query` → `server`), so 443 has one owner (Q22).
+- **Parity before removal.** Every traefik router today has a matching route, verified by a compare that requests each hostname through both (`proxy.compare`, the HTTP counterpart of `logs.compare`), before traefik's container is stopped (§10 Phase 6).
+
+**Leaves.** `self.proxy.route.set/remove/list`, `self.proxy.compare`, `self.proxy.status`. **Permissions.** `digby.proxy.edit`; routes from deploy are written by the app's deploy integration, not by hand.
 
 ## 7. Rummage gaps
 
@@ -705,6 +719,10 @@ Acceptance: the compare report against Technitium shows no unexplained differenc
 
 G8 (`rummage-ext-tls`, the ACME driver, the DNS-01 slot), `@cldmv/lib-route53` (standalone, built here with its first consumer, starting before G8 lands), `public` minimal with `acme.dns01` and `public-driver-route53` on that library limited to `_acme-challenge.*` TXT writes, the acme.sh takeover (§11), then DoT and DoH listeners on the LAN and tailnet addresses with the certificate Digby now owns. Why here: after the cutover, so DNS is stable and compared; independent of the mode; before linked servers, which each need a certificate for their admin UI and DoT; and because it touches files other services read (traefik, Quack) it deserves its own slice and its own rollback. acme.sh keeps working meanwhile, so nothing forces it earlier.
 
+### Slice 3b — the front door: Digby replaces traefik
+
+`proxy` (§6.18): TLS from Digby's own certificates, routes for every traefik router today, routes fed from `rummage deploy` (#46), the shared allow lists in views with NXDOMAIN filtering in `server` (#47, #48), the admin UI and DoH as proxy routes. It needs slice 3's certificates. Acceptance: `proxy.compare` shows every hostname answering the same through Digby and through traefik, a listed source reaches only its listed names (by SNI and Host) and resolves only those, and traefik is then removed (§10 Phase 6).
+
 ### Slice 4 — linked servers (mode 2)
 
 G7 replication, `cluster` (join, status, promote), `views` per UniFi network, the `networks` mode switch to mode 2 (every LAN-reachable node handed out, forward rules removed, through the UniFi driver), the split route listing every tailnet-reachable node (through the Tailscale driver), health findings for lag and reachability. A node is any server; nothing in this slice depends on what hardware it is.
@@ -722,7 +740,7 @@ Goal: no DNS outage, every step reversible by itself, the first release in mode 
 1. **[you]** Export `homelab.cldmv.net` from Technitium as a zone file (or allow one AXFR to `127.0.0.1` for Digby's import). The zone list is confirmed (Q9): `homelab.cldmv.net` with its wildcard and the empty `quack.shellback.net`, nothing else; no query logs, no settings, nothing else is migrated. The container's compose or run definition is needed for Phase 5.
 2. **[you]** Console check: the Network application's version and the presence of the Forward Domain record type (Settings › Policy Engine › DNS or Settings › Policy Table on 9.x). Apply the pending console update first if the version predates it (§4.2). Create a Forward Domain rule for a throwaway domain pointing at `10.0.1.165` and confirm a LAN client resolves a name under it through the gateway, then delete it; that proves the mechanism before anything depends on it.
 3. **[you]** Digby's LAN address: `sudo nmcli con mod "Wired connection 1" +ipv4.addresses 10.0.1.166/23` then `sudo nmcli con up "Wired connection 1"` (a brief blip on `eno1`; confirm with `ip -br addr`), and a UniFi fixed IP or reservation for `10.0.1.166` so DHCP never hands it out (`.166` answers no ARP or ping today). Later this becomes a `networks`/`unifi` fix step (§4.10).
-4. **[you]** In Portainer, stack `traefik-proxy`: change the traefik container's port bindings from `0.0.0.0:80`/`:443` and `[::]:80`/`:443` to `10.0.1.165:80`/`:443` and `100.64.178.0:80`/`:443`, plus the IPv6 addresses if they are used, and redeploy the container. Required before Digby can use `.166:443` (DoH, and the admin UI on 443 if wanted); the first release's admin UI is on `.166:8443`, so this step can wait until slice 3, but doing it now removes the dependency. Rollback: restore the bindings.
+4. **[you]** In Portainer, stack `traefik-proxy`: change the traefik container's port bindings from `0.0.0.0:80`/`:443` and `[::]:80`/`:443` to `10.0.1.165:80`/`:443` and `100.64.178.0:80`/`:443`, plus the IPv6 addresses if they are used, and redeploy the container. Required before Digby can use `.166:443` (DoH, and the admin UI on 443 if wanted); the first release's admin UI is on `.166:8443`, so this step can wait until slice 3, but doing it now removes the dependency. It is interim: traefik is removed in Phase 6. Rollback: restore the bindings.
 5. **[you]** `rummage deploy setup` as root once G3 has landed in rummage#717 (user `digby`, groups, `/var/lib/digby/main`, `/etc/digby/instances/main.json`, `/etc/digby/backup-passphrase`, the secrets credential; it prints the operator step, which is not needed until slice 2).
 6. **[Digby]** `rummage deploy main`; claim at `https://10.0.1.166:8443/` with the setup token; onboarding: listeners `10.0.1.166:53`, `10.0.1.165:53` and `100.64.178.0:53` configured with `retryBind` (they wait: Technitium holds `0.0.0.0:53`), plus a shadow listener `10.0.1.166:5353` that binds now; views seeded with `10.0.0.0/23` and `100.64.0.0/10`; reach preset `lan-tailnet`.
 7. **[Digby]** Import `homelab.cldmv.net` (file or AXFR); add the reverse zones `0.0.10.in-addr.arpa` and `1.0.10.in-addr.arpa` (new: Technitium has none) with PTRs for the known hosts; set the `tailnet` view variants (`*.homelab` and the apex → `100.64.178.0`); create the one-name zone `quack.shellback.net` in the `tailnet` view with A `100.94.135.85` (§4.15; slice 2 takes it over from the machine alias); add the forward zones `tail935f4f.ts.net → 100.100.100.100` and `localdomain → 10.0.0.1` (the month-long transition, §4.11); resolver mode recursive (or, for a like-for-like first compare, the forwarders Technitium uses, then back to recursive).
@@ -760,17 +778,25 @@ Rollback: none needed; nothing points at Digby.
 22. **[Digby]** After about a month, when the `localdomain` forward zone's query counter has been zero for a week, remove the forward zone (§4.11).
 23. **[Digby, slice 2]** The `networks` orchestrator reads the forward rules and DHCP settings through its UniFi driver, recognises mode 1 and reports drift from what Digby expects; through its Tailscale driver, its checks confirm the split routes answer.
 
+### Phase 6 — the front door: retiring traefik (slice 3b)
+
+24. **[Digby]** Configure the proxy's routes (one per traefik router, or imported from `/srv/traefik/dynamic`), bound to a test listener `10.0.1.166:8444`. Run `proxy.compare` against traefik on `10.0.1.165:443` for every hostname; fix every unexplained difference.
+25. **[Digby]** Bind the proxy to `10.0.1.166:443` and `:80`; point the homelab records at `.166` view by view (the `lan` view first, then `tailnet`), watching traefik's access log go quiet.
+26. **[you]** Stop the traefik container in Portainer (keep the stack). The proxy's `retryBind` listeners take `10.0.1.165:443`/`:80` and `100.64.178.0:443`/`:80` within a second. Rollback: stop those listeners, start traefik.
+27. **[Digby]** Turn on the allow lists for the sources that have one (the LLM server, its pods' listener), DNS and proxy together.
+28. **[you]** After two weeks with no rollback, remove the traefik stack and `/srv/traefik/dynamic`; drop the reload hook from the certificate export (§11).
+
 ### What stays untouched
 
-The acme.sh renewal until slice 3 (§11); Stratax's relay (`ics.cldmv.net` is public); `tailscale set --accept-dns` on 01; the `tailscale0` link's MagicDNS routing; UniFi's DHCP role; the Route 53 wildcard; Technitium's configuration until its container is stopped in Phase 3.
+The acme.sh renewal until slice 3 (§11); traefik until Phase 6; Stratax's relay (`ics.cldmv.net` is public); `tailscale set --accept-dns` on 01; the `tailscale0` link's MagicDNS routing; UniFi's DHCP role; the Route 53 wildcard; Technitium's configuration until its container is stopped in Phase 3.
 
 ## 11. Certificates: taking over from acme.sh
 
-**Today.** acme.sh (`/srv/acme/acme.sh`) issues `*.homelab.cldmv.net` and the other SANs traefik presents (`*.01.homelab.cldmv.net`, `*.scopra.homelab.cldmv.net`, `homelab.cldmv.net`) by DNS-01 against Route 53, into `/srv/certs/homelab.key` and `/srv/certs/homelab.fullchain.pem`: `root:repo`, mode 0640, ACL `user:glmtest:r--` with mask `r--`, last renewed 2026-09-26. Readers (**decided**, Q20): the traefik container (bind-mount `/srv/certs` → `/certs`; it re-reads certificates only when its dynamic configuration reloads), Quack on `:18543` (`server.https`, hot-reloaded on change) and glmtest's Quack instances (through the ACL, hot-reloaded the same way). The takeover must keep the owner, the mode and the ACL, and give traefik a reload after each renewal.
+**Today.** acme.sh (`/srv/acme/acme.sh`) issues `*.homelab.cldmv.net` and the other SANs traefik presents (`*.01.homelab.cldmv.net`, `*.scopra.homelab.cldmv.net`, `homelab.cldmv.net`) by DNS-01 against Route 53, into `/srv/certs/homelab.key` and `/srv/certs/homelab.fullchain.pem`: `root:repo`, mode 0640, ACL `user:glmtest:r--` with mask `r--`, last renewed 2026-09-26. Readers (**decided**, Q20): the traefik container (bind-mount `/srv/certs` → `/certs`; it re-reads certificates only when its dynamic configuration reloads), Quack on `:18543` (`server.https`, hot-reloaded on change) and glmtest's Quack instances (through the ACL, hot-reloaded the same way). The takeover must keep the owner, the mode and the ACL, and give traefik a reload after each renewal while traefik runs. Once Digby's own proxy replaces traefik (§6.18, §10 Phase 6), the proxy serves the certificate from secrets, traefik drops off the reader list and the reload hook goes; the export stays for Quack and glmtest's instances.
 
 **What Digby does** (slice 3, G8): obtain and renew wildcards and single names by ACME. A wildcard needs DNS-01, and Digby is not publicly authoritative, so it writes the `_acme-challenge` TXT records through the Route 53 driver, with an IAM policy limited to `ChangeResourceRecordSets` for `TXT` records named `_acme-challenge.homelab.cldmv.net` / `_acme-challenge.*.homelab.cldmv.net` (and the `shellback.net` equivalents when a certificate there is wanted) on those two hosted zones, plus `GetChange`. That is the one Route 53 write the certificate feature needs; full record management stays in the later public slice.
 
-**Keys.** The ACME account key and every certificate's private key live in rummage secrets. The one copy outside the store is the exported key file at mode 0600, because traefik reads files; nothing about a key is ever in a record, a log, an answer or the admin UI.
+**Keys.** The ACME account key and every certificate's private key live in rummage secrets. The one copy outside the store is the exported key file at mode 0600, because traefik and Quack read files (the proxy that replaces traefik reads secrets directly); nothing about a key is ever in a record, a log, an answer or the admin UI.
 
 **Takeover steps.**
 
@@ -852,6 +878,8 @@ Numbers are stable across revisions. **Decided** items record the decision; item
 - Also decided: UniFi management of every network's DNS settings, search domain, fixed IPs and network list through the `networks` orchestrator's UniFi driver (writes opt-in, admin, audited); UniFi and Tailscale as drivers of `networks` with a vendor-neutral driver contract, so another router or VPN vendor plugs in the same way; the standalone `lib-unifi` and `lib-tailscale`; Tailscale health as admin to-do items with fix steps; `quack.shellback.net` as the worked example of naming a shared-in device.
 
 - **Q20** `/srv/certs/homelab.key` and `homelab.fullchain.pem` are `root:repo` 0640 with ACL `user:glmtest:r--` (mask `r--`), last renewed 2026-09-26; readers are the traefik container (`/srv/certs` → `/certs`), Quack on `:18543` and glmtest's Quack instances. The takeover writes in place to keep owner, mode and ACL, adds an ACL entry for the digby user, and reloads traefik after each renewal (§11).
+- **Q22** The admin UI port: `8443` on Digby's addresses in the first release; once the proxy owns 443 (slice 3b) the admin UI and DoH are routes on it (`digby.homelab.cldmv.net`, `/dns-query`), so nothing else binds 443.
+- **Q25** Digby replaces traefik with its own reverse proxy, `digby-ext-proxy` (§6.18), as its own slice (3b) after the certificate takeover; traefik keeps running until the proxy reaches parity and is then removed (§10 Phase 6). One allow list per source, held in views, drives both DNS filtering and the proxy (#47, #48). Tracked in #49.
 
 ### Open: facts to confirm
 
@@ -859,7 +887,6 @@ None.
 
 ### Defaults — not yet confirmed by the user
 
-- **Q22** The admin UI port: `8443` on Digby's addresses in the first release, moving to `443` on `.166` once traefik is narrowed. *Default: as stated.*
 - **Q23** The first compare runs with the resolver in forwarder mode mirroring Technitium's forwarders, then switches to recursion, so differences are Digby's and not the upstream's. *Default: yes, if Technitium's forwarders are known from its UI; otherwise compare in recursive mode and accept upstream-caused TTL and ordering differences.*
 - **Q24** Reverse zones are new (Technitium has none): PTRs for every address the `networks` extension knows, generated from `machines` in slice 2; hand-entered for the known hosts in slice 1. *Default: yes.*
 
