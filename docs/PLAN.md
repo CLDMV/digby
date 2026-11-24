@@ -606,6 +606,15 @@ await queries.append(rows); await queries.query({ since, until, where, limit });
 await queries.retention.set("30d");   // an admin's change (Q14)
 ```
 
+**Engine** (**decided**, [rummage#760](https://github.com/CLDMV/rummage/issues/760#issuecomment-7144901507)): rummage's existing SQLite engine, with no new engine.
+- **Segments:** one database file per `rotate` period, a day by default, kept apart from the host database in a folder that backups and `VACUUM INTO` snapshots skip.
+- **Expiry:** deletes a whole segment file, with no row deletes and no VACUUM.
+- **Appends:** batched, one transaction per batch.
+- **Queries:** time-range queries and `GROUP BY` roll-ups run in SQLite per segment and are merged across segments.
+- **Interface:** callers see only `self.host.storage.series`, so the engine can change later without them changing.
+
+Embedded NoSQL engines and DuckDB were ruled out, because they are native builds per platform.
+
 ### G5. A roles extension (`rummage-ext-roles`)
 
 **Why.** Person permissions exist, the org's roles exist, but the role-to-permission matrix with its editor lives in `stratax-ext-roles`. Per-person accounts come after the first release (Q16); when they do, viewer and operator roles should be a rummage package, which also registers the MCP access resolver (`"read"` for viewers). Sketch: `role` and `role-grant` records, `self.roles.permit(id)`, the grant provider through `callbacks: { "@cldmv/rummage": { "permissions.grant": "@cldmv/rummage-ext-roles" } }`, a settings page over `self.host.permissions.list()`, `self.host.access.changed({ roles })` on edit.
