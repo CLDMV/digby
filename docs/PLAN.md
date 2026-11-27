@@ -311,7 +311,7 @@ Few dependencies pinned by lockfile; `rummage build --dependencies lockfile`; `n
 | **`proxy` is added** (Q25): the reverse proxy that replaces traefik, with per-source allow lists shared with views (§6.18). | Digby already owns the names, the views and the certificates; one list gating both DNS and HTTP can't drift |
 | `public` and `public-driver-route53` stay but move later; `blocking`, `dnssec`, `transfer`, `cluster`, `dhcp` are later slices. | Q3, Q5, the mode model |
 
-The extensions: `server`, `zones`, `views`, `resolver`, `logs`, `health`, `networks`, `networks-driver-unifi`, `networks-driver-tailscale`, `machines`, `public`, `public-driver-route53`, `cluster`, `dnssec`, `transfer`, `blocking`, `dhcp`, `proxy` (eighteen) plus the `digby` app; the libraries `lib-unifi`, `lib-tailscale`, `lib-route53`.
+The extensions: `wire`, `server`, `zones`, `views`, `resolver`, `logs`, `health`, `networks`, `networks-driver-unifi`, `networks-driver-tailscale`, `machines`, `public`, `public-driver-route53`, `cluster`, `dnssec`, `transfer`, `blocking`, `dhcp`, `proxy` (nineteen) plus the `digby` app; the libraries `lib-unifi`, `lib-tailscale`, `lib-route53`.
 
 Conventions shared by all of them: the sectional layout (`src/api/<slug>/`, `src/view/<slug>/`, `src/lib/`, `sql/`), leaf names by directory nesting (`self.zones.record.set`, never camelCase), `platforms: ["web"]`, `requires` listing the rummage packages each builds on, record types as global lowercase hyphenated names with `scope: "org"` and `history: "all"`, manifest `public` / `symbols` / `permissions` / `emits` / `subscribes`, an `operations` contribution (the MCP tools and REST endpoints the extension or driver owns, §6.17; a driver contributes reads only, every write goes through its orchestrator), a `docs/<slug>.md` on the rummage template, and `tests/*.test.vitest.mjs` composed through `composeTestHost`.
 
@@ -363,7 +363,7 @@ Read scopes and write scopes are separate clients or separately granted; the lib
 
 **Permissions.** `digby.server.listeners.edit`, `digby.server.policy.edit`, `digby.server.cache.flush`.
 
-**Codec.** RFC 1035 with compression and pointer-loop guards; EDNS(0) with cookie, tcp-keepalive, padding and extended-error options; typed rdata for A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, CAA, NAPTR, TLSA, SSHFP, HTTPS/SVCB, DS, DNSKEY, RRSIG, NSEC, NSEC3, NSEC3PARAM, CDS, CDNSKEY, TSIG, OPT, and `TYPEnnn` for the rest; strict lengths, no allocation on claimed counts, per-transport size caps; a pure module (`src/lib/wire/`) with no I/O.
+**Codec.** RFC 1035 with compression and pointer-loop guards; EDNS(0) with cookie, tcp-keepalive, padding and extended-error options; typed rdata for A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, CAA, NAPTR, TLSA, SSHFP, HTTPS/SVCB, DS, DNSKEY, RRSIG, NSEC, NSEC3, NSEC3PARAM, CDS, CDNSKEY, TSIG, OPT, and `TYPEnnn` for the rest; strict lengths, no allocation on claimed counts, per-transport size caps. The codec is its own extension, `digby-ext-wire` (§6.19): server consumes it through `self.wire.*` and declares it as a requirement (CLDMV/digby#42); nothing deep-imports it.
 
 ### 6.4 `digby-ext-zones`
 
@@ -529,6 +529,10 @@ Digby replaces traefik as the reverse proxy on 01 (**decided**, Q25). The proxy 
 - **Parity before removal.** Every traefik router today has a matching route, verified by a compare that requests each hostname through both (`proxy.compare`, the HTTP counterpart of `logs.compare`), before traefik's container is stopped (§10 Phase 6).
 
 **Leaves.** `self.proxy.route.set/remove/list`, `self.proxy.compare`, `self.proxy.status`. **Permissions.** `digby.proxy.edit`; routes from deploy are written by the app's deploy integration, not by hand.
+
+### 6.19 `digby-ext-wire` — the DNS wire codec (CLDMV/digby#42)
+
+The codec is its own extension, not a module of `server` (§6.3): `self.wire.decode` / `.encode` / `.encodeCapped`, the presentation helpers (`record.parse`/`.format`, `name.parse`/`.format`/`.canonical`/`.key`, `ttl.parse`, `rdata.parse`/`.format`/`.encode`/`.decode`, `type.name`, `class.name`), `self.wire.framer.create()` (TcpFramer is stateful, so callers get it through a factory), `self.wire.constants.*` (TYPE, CLASS, RCODE) and `self.wire.errors.*` (WireError and its codes). The inner loops stay plain modules under its `src/lib`; the unit, property and fuzz suites moved with the files, history included. It depends on no other digby extension, so it can be lifted into a standalone library later just by moving it. `server`, `zones`, `transfer`, `dnssec`, `resolver` and `public` declare it as a requirement and call `self.wire.*`; nothing deep-imports it. Not published to npm (CLDMV/digby#42).
 
 ## 7. Rummage gaps
 
