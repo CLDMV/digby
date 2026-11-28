@@ -116,7 +116,7 @@ Principles:
 - **Compiled snapshots.** A control-plane extension recompiles an immutable snapshot on its own `data:changed` and hands it to the server through one scoped leaf, `self.server.snapshot.set(kind, snapshot)`. The server swaps the pointer atomically; a query never calls another extension.
 - **The resolver** is the one cross-extension call on the query path, on a cache miss only, captured at activate. It recurses from the root servers with DNSSEC validation in every mode; forwarders are configuration, not the default.
 - **No I/O outside the framework.** Sockets from `self.host.net.listen` (G1); upstream exchanges from `self.host.net.udp.exchange` / `tcp.connect` (G2); HTTP to UniFi, Tailscale and Route 53 through the guarded fetch injected into the libraries (G6). `rummage audit network` keeps it that way.
-- **Integration libraries are plain ESM** with injected credentials and fetch, no rummage, no Digby: `@cldmv/lib-unifi`, `@cldmv/lib-tailscale` and `@cldmv/lib-route53` (**decided**, Q18). Driver extensions wrap them (`networks-driver-unifi`, `networks-driver-tailscale`, `public-driver-route53`); the orchestrators they plug into add records, permissions, audit and UI.
+- **Integration libraries are slothlet API packages** — slothlet for composition (`self`, context and lifecycle), not rummage, and no Digby — each exposing a factory (`createUnifi` / `createTailscale`) that composes the library's own slothlet instance over its `api/` and returns that api; credentials and `fetch` enter through the factory (**decided**, Q18): `@cldmv/lib-unifi`, `@cldmv/lib-tailscale` and `@cldmv/lib-route53`. Driver extensions wrap them (`networks-driver-unifi`, `networks-driver-tailscale`, `public-driver-route53`); the orchestrators they plug into add records, permissions, audit and UI.
 - **Performance.** A homelab's load is tens of queries per second with bursts into the thousands; a single Node process with the hot path inside one extension handles it with room; the budget is under 1 ms for an authoritative or cached answer (§12).
 - **Platform.** A served rummage app (`rummage build --target web`); `self.host.role()` is `"server"`; every extension declares `platforms: ["web"]`.
 
@@ -322,7 +322,7 @@ Conventions shared by all of them: the sectional layout (`src/api/<slug>/`, `src
 
 ### 6.2 The libraries
 
-Standalone repositories under CLDMV, plain ESM, no dependency on rummage or Digby, credentials and `fetch` injected, their own vitest suites with recorded fixtures, the v4 CI set, published to npm (**decided**, point 5).
+Standalone repositories under CLDMV, slothlet API packages — slothlet for composition (`self`, context and lifecycle), not rummage, and no Digby — each exposing a factory that composes the library's own slothlet instance over its `api/` and returns that api, credentials and `fetch` entering through the factory, their own vitest suites with recorded fixtures, the v4 CI set, published to npm (**decided**, point 5).
 
 **`CLDMV/lib-unifi` → `@cldmv/lib-unifi`.** One interface over two APIs: the official UniFi Integration API (an API key created on the console) is preferred; the legacy controller API that `CLDMV/unifi-cli` uses (`lib/api/*`: login with a local account, `rest/networkconf`, `rest/user`, `v2/api/site/{site}/client/{id}`, `static-dns`) fills in what the official API cannot do. Callers see one surface:
 
@@ -337,7 +337,43 @@ await unifi.clients.fixedIp.set(mac, ip);
 await unifi.dns.records.list(); await unifi.dns.forward.set({ domain, target });  // the Forward Domain rules
 ```
 
-Every write takes `{ dryRun: true }` and answers the change it would make. `unifi-cli` later becomes a thin CLI on it.
+[**Decided** (exposure): `createUnifi` composes the library's own slothlet instance over the package's `api/` and returns that api — the returned object **is** the library's slothlet api. Credentials and config go in through the factory and stay inside the library's own instance (per-instance credential isolation), so any project can use the library. No host-mount surface for now: no `api.add` manifest, no exported api dir. The Digby drivers call the factory from their own leaves.]
+
+Every write takes `{ dryRun: true }` and answers the change it would make.
+
+**What unifi-cli already does.** `CLDMV/unifi-cli` (`origin/dev`, slothlet-based) carries much of the legacy controller API already; lib-unifi ports the general parts instead of rewriting them. An inventory of its `lib/` code, each piece marked **general** (general API access — lib-unifi takes it over) or **CLI-specific** (serves the CLI's own auto-IP and scanning jobs — it stays with unifi-cli):
+
+- `lib/api/login/login.mjs` — **general.** UniFi OS login on `:443` (`/api/auth/login`, captures the session cookie and `x-csrf-token`) with legacy fallback on `:8443` (`/api/login`, the `unifises` cookie, a `Referer` header), site-keyed login metadata cached for offline reuse.
+- `lib/api/request/request.mjs` — **general.** The authenticated request path: cookie and CSRF headers, automatic re-login when the session is missing, endpoint resolution through the site config, response caching keyed by host/site/user/endpoint/method (payload hash for bodies), an HTTP-error collector, and the axios/`httpsAgent` setup (`rejectUnauthorized: secure !== false`).
+- `lib/api/controller/controller.mjs` — **general** (init sequence only): login → device-type detection → endpoint-type detection. The console printing and `process.exit` error paths are not ported.
+- `lib/api/util/controller.mjs` — **general.** Endpoint-type detection: probes `api/s/{site}/stat/sysinfo` (version ≥ 7.4 → `unifi_os_v2`, else `unifi_os_v1`), then `api/stat/sites`, then the Protect bootstrap; UDM/NVR probes on `/proxy/network/api` and `/proxy/protect/api`; results merged into the site config and cached. Its `getDefault` (default-gateway → `https://<gateway>:443`) is **CLI-specific**.
+- `lib/api/config/config.mjs` — **general, reshaped.** The site model: multi-site config, `getSiteData` host/prefix resolution, `mergeSite` deep-merge, masked output. lib-unifi takes the site/host/prefix resolution; the config-file and CLI-argument loading (`read`, `load`) is **CLI-specific** — the factory takes the same data as an object.
+- `lib/api/util/url.mjs` — **general.** Endpoint key → URL resolution over the endpoint map with variable substitution, https normalization and query-param building.
+- `lib/api/map/map.mjs` and `lib/endpointMap.mjs` — **general.** The endpoint template tables (`unifi_os_v2` / `unifi_os_v1` / `legacy` / `protect`) with fallback lookup and `{site}`/`{id}` substitution: RADIUS users, admin users, device and client listings, `client_update` (PUT `api/s/{site}/rest/user/{id}` with `fixed_ip`), `portconf`, `networkconf`, `stat/sites`, `stat/sysinfo`, the Protect bootstrap. Two copies exist (the slothlet `lib/api/map` and the older standalone `lib/endpointMap.mjs`); lib-unifi keeps one.
+- `lib/api/device/detect.mjs`, `lib/api/device/map.mjs`, `lib/api/util/extract.mjs`, `lib/api/device/calc.mjs` — **CLI-specific.** Device classification (AP/switch/gateway/camera/NVR from model regexes and `type`), name-section parsing (`C-<n>-<m>` / `W-…` building-room ids that derive the auto-IP target), the per-type device Map with find/dump, and the IP arithmetic (`targetIP`, `targetNVRIP`). This is the naming-convention layer of the CLI's auto-IP job, not controller API access.
+- `lib/api/device/scan.mjs` — **CLI-specific in shape, general in calls.** The network-topology builder over `device_list`, `client_list`, `device_stat`, `site_info`, `port_config`, `network_config`. The endpoint calls are general; the topology/tree/display logic is the CLI's scan task.
+- `lib/api/device/update.mjs` — **general** (small): PUTs `fixed_ip`/`use_fixedip` to `client_update` and normalizes the `{ meta: { rc } }` response.
+- `lib/api/log/log.mjs` — **CLI-specific.** File-keyed log write/stream/delete for CLI output capture.
+- `lib/api/task/auto-ip.mjs` — **CLI-specific.** The auto-IP task itself: fixed-IP assignment from the section rules, the NVR site handling, batched client updates.
+- `lib/api/cache/cache.mjs` — **general, reshaped.** Keyed JSON file cache with sanitization; the cache-offline request/replay pattern becomes lib-unifi's recorded-fixture harness, not a runtime cache.
+- `lib/manifests/*` — **CLI-specific.** The device manifest and UniFi model stubs — model-number lookup for the CLI's naming, not API access.
+- `lib/controller.mjs`, `lib/util.mjs`, `index.mjs`, `index2.mjs` — **superseded.** The pre-slothlet controller (`lib/controller.mjs` duplicates login/request/detection without the slothlet composition) and the two yargs CLI entry points.
+
+**The port.** lib-unifi takes over the general parts into the slothlet layout — one-function leaves, directory namespaces, internals under `src/lib/`, the `createUnifi` factory, credentials and `fetch` through the factory — and adds the official Integration API alongside the legacy one:
+
+| unifi-cli source | Ported to | What changes |
+|---|---|---|
+| `lib/api/login/login.mjs` | `src/lib/auth/` (login, session, re-login) | slothlet leaves; the injected `fetch` replaces axios and the `httpsAgent` (SPKI pinning per §3); the site-keyed session lives in the library's own instance; `process.exit` paths become typed errors; the offline/skip-login cache read becomes fixture replay |
+| `lib/api/request/request.mjs` | `src/lib/transport/request.mjs` | the request shape stays (cookie + CSRF headers, self-relogin, error collection); cache-offline becomes the recorded-fixture harness |
+| `lib/api/config/config.mjs` | `src/lib/sites.mjs` | the site/host/prefix model stays (`getSiteData`, `mergeSite`); file and argv loading is dropped — the factory takes the config object |
+| `lib/api/util/url.mjs` | `src/lib/url.mjs` | resolution logic unchanged; the base URL comes from the factory config |
+| `lib/api/map/map.mjs` (+ the duplicate `lib/endpointMap.mjs`) | `src/lib/endpoints.mjs` | one merged template table; the legacy rows (`stat/device`, `stat/sta`, `rest/user/{id}`, `rest/networkconf`, `stat/sysinfo`, `stat/sites`, `rest/portconf`) stay as written |
+| `lib/api/util/controller.mjs` (detection) | `src/api/capabilities.mjs` | the endpoint-type/version probing becomes the capability probe — the same `dns.forward: official \| legacy \| none` surface §4.2 consumes; the UDM/NVR probes stay |
+| `lib/api/device/update.mjs` | `src/api/clients/fixed-ip/set.mjs` | the PUT with `fixed_ip` and the `{ meta: { rc } }` normalization, plus `{ dryRun: true }` answering the change |
+| `lib/api/device/scan.mjs` (the endpoint calls) | `src/api/networks/list.mjs`, `src/api/clients/list.mjs` | the general endpoint calls (`device_list`, `client_list`, `device_stat`, `site_info`, `port_config`, `network_config`) become typed list leaves; the topology/display logic stays with unifi-cli |
+| `lib/api/cache/cache.mjs` | the fixture recorder under `tests/` | the keyed request/replay pattern becomes the recorded-fixture harness |
+
+The CLI-specific pieces (device classification and name-section parsing, the device Maps, the topology builder's tree logic, the auto-IP task, the log writer, the manifests) stay with unifi-cli; lib-unifi's `networks` and `clients` surfaces expose the raw controller data they were built from. The ported pieces get fixtures like the rest — the hand-written ones cite unifi-cli's source (request shapes: headers, cookies, endpoint templates, response normalizations) and UniFi's published documentation.
 
 **`CLDMV/lib-tailscale` → `@cldmv/lib-tailscale`.** The official REST API with an OAuth client (token exchange inside the library), plus tailscaled's LocalAPI over its Unix socket:
 
@@ -352,9 +388,11 @@ const { policy, etag } = await ts.policy.get(); await ts.policy.set(policy, { if
 await ts.local.status(); await ts.local.prefs.patch({ AdvertiseRoutes: ["10.0.0.0/23"] });   // the LocalAPI, needs the operator
 ```
 
+[**Decided** (exposure): `createTailscale` composes the library's own slothlet instance over the package's `api/` and returns that api — the returned object **is** the library's slothlet api. Credentials and config go in through the factory and stay inside the library's own instance (per-instance credential isolation), so any project can use the library. No host-mount surface for now: no `api.add` manifest, no exported api dir. The Digby drivers call the factory from their own leaves.]
+
 Read scopes and write scopes are separate clients or separately granted; the library never asks for more than the call needs.
 
-**`CLDMV/lib-route53` → `@cldmv/lib-route53`** (**decided**, Q18): the same shape as the other two, plain ESM with injected credentials, no rummage or Digby dependency. It wraps AWS's official SDK client (`@aws-sdk/client-route-53`, installed at its latest version) rather than hand-writing SigV4 and the XML API; the library adds what Digby's callers need on top: scoped helpers (`ChangeResourceRecordSets` and `GetChange` first, for the slice-3 `_acme-challenge` TXT writes; `ListResourceRecordSets` and the DNSSEC calls when record management arrives), a dry-run plan of a change, change-status waiting, and errors mapped to typed codes. Credentials are passed in (never read from the environment or `~/.aws` by default). `digby-ext-public-driver-route53` is the driver built on it, plugged into the `public` orchestrator. It is built in **slice 3**, with its first consumer (§9): nothing earlier uses it, and a client library shaped before its consumer exists invents an API.
+**`CLDMV/lib-route53` → `@cldmv/lib-route53`** (**decided**, Q18): the same shape as the other two, a slothlet API package with injected credentials — slothlet for composition (`self`, context and lifecycle), not rummage, and no Digby. It wraps AWS's official SDK client (`@aws-sdk/client-route-53`, installed at its latest version) rather than hand-writing SigV4 and the XML API; the library adds what Digby's callers need on top: scoped helpers (`ChangeResourceRecordSets` and `GetChange` first, for the slice-3 `_acme-challenge` TXT writes; `ListResourceRecordSets` and the DNSSEC calls when record management arrives), a dry-run plan of a change, change-status waiting, and errors mapped to typed codes. Credentials are passed in (never read from the environment or `~/.aws` by default). `digby-ext-public-driver-route53` is the driver built on it, plugged into the `public` orchestrator. It is built in **slice 3**, with its first consumer (§9): nothing earlier uses it, and a client library shaped before its consumer exists invents an API.
 
 ### 6.3 `digby-ext-server` — listeners, query engine
 
@@ -436,11 +474,11 @@ Normalised shapes: `network { id, name, vlan, cidr, gateway, dhcp { range, lease
 
 ### 6.9 `digby-ext-networks-driver-unifi`
 
-Placed at `networks.driver.unifi`, built on `@cldmv/lib-unifi`. **Reports:** every network and VLAN with its DHCP DNS servers and domain, clients with addresses and fixed IPs, the Forward Domain rules, the controller's capabilities and version. **Writes it can apply** (opt-in, admin, audited, through the orchestrator): `network.dns.set` (the DHCP DNS servers and search domain of a network), `client.fixedIp.set`, `dns.forward.set` (Forward Domain rules). **Checks:** the Forward Domain capability (`official` / `legacy` / `none`), drift between the rules and Digby's domains, each network's DHCP DNS against the active mode, a pending console update, the legacy fallback in use. **Settings and secrets:** `baseUrl`, `site`, `writesEnabled`; the API key and the legacy account in its own secrets scope. **Needs** G6 (the controller is a private address with a self-signed certificate pinned by SPKI; the driver hands the bound fetch to the library). Later a DHCP lease source for `dhcp`.
+Placed at `networks.driver.unifi`, built on `@cldmv/lib-unifi` — the driver calls the library's `createUnifi` factory from its own leaves. **Reports:** every network and VLAN with its DHCP DNS servers and domain, clients with addresses and fixed IPs, the Forward Domain rules, the controller's capabilities and version. **Writes it can apply** (opt-in, admin, audited, through the orchestrator): `network.dns.set` (the DHCP DNS servers and search domain of a network), `client.fixedIp.set`, `dns.forward.set` (Forward Domain rules). **Checks:** the Forward Domain capability (`official` / `legacy` / `none`), drift between the rules and Digby's domains, each network's DHCP DNS against the active mode, a pending console update, the legacy fallback in use. **Settings and secrets:** `baseUrl`, `site`, `writesEnabled`; the API key and the legacy account in its own secrets scope. **Needs** G6 (the controller is a private address with a self-signed certificate pinned by SPKI; the driver hands the bound fetch to the library). Later a DHCP lease source for `dhcp`.
 
 ### 6.10 `digby-ext-networks-driver-tailscale`
 
-Placed at `networks.driver.tailscale`, built on `@cldmv/lib-tailscale`. **Reports:** devices owned and shared-in (with `shared`), the tailnet's DNS configuration (resolvers, split routes, Override, MagicDNS, search paths), routes advertised by 01 and approved, the policy file with its ETag. **Writes it can apply:** `dns.splitRoute.set`, `route.advertise` (tailscaled's LocalAPI on 01, which needs the operator step), `route.approve`, `policy.grant` (a clearly marked block, written with `If-Match`, refused if the file changed). **Checks:** the §4.9 table (split route, Override, MagicDNS, routes, ACLs, shared-in nodes, reachability, split routes answered). **Secrets:** the read-only OAuth client; the write client separately, enabled by its own opt-in (**decided**, Q15). **Needs** G6 (the LocalAPI over the Unix socket) and the operator step (G3).
+Placed at `networks.driver.tailscale`, built on `@cldmv/lib-tailscale` — the driver calls the library's `createTailscale` factory from its own leaves. **Reports:** devices owned and shared-in (with `shared`), the tailnet's DNS configuration (resolvers, split routes, Override, MagicDNS, search paths), routes advertised by 01 and approved, the policy file with its ETag. **Writes it can apply:** `dns.splitRoute.set`, `route.advertise` (tailscaled's LocalAPI on 01, which needs the operator step), `route.approve`, `policy.grant` (a clearly marked block, written with `If-Match`, refused if the file changed). **Checks:** the §4.9 table (split route, Override, MagicDNS, routes, ACLs, shared-in nodes, reachability, split routes answered). **Secrets:** the read-only OAuth client; the write client separately, enabled by its own opt-in (**decided**, Q15). **Needs** G6 (the LocalAPI over the Unix socket) and the operator step (G3).
 
 ### 6.11 `digby-ext-machines`
 
@@ -546,7 +584,7 @@ Publication is checked, not assumed: an entry that does not resolve on the compo
 
 ## 7. Rummage gaps
 
-Anything Digby needs that is not DNS-specific is a rummage capability, listed with the reason and an API sketch; each becomes a rummage issue once the plan is agreed. The libraries (`lib-unifi`, `lib-tailscale`) need nothing from rummage: they are plain ESM with injected `fetch` and credentials; the extension boundary needs G6. Ordered by when Digby needs it.
+Anything Digby needs that is not DNS-specific is a rummage capability, listed with the reason and an API sketch; each becomes a rummage issue once the plan is agreed. The libraries (`lib-unifi`, `lib-tailscale`) need nothing from rummage: they are slothlet API packages with injected `fetch` and credentials; the extension boundary needs G6. Ordered by when Digby needs it.
 
 ### G1. Network listeners as a host capability (`self.host.net.listen`)
 
@@ -726,7 +764,7 @@ Each slice ends in something that runs on 01 and is proven by §12. A slice does
 ### Slice 0 — rummage and the libraries first
 
 - Rummage: G1 (listeners with `retryBind`), G2 (outbound), G3 (into #717: capabilities, hardening, groups, operator step, non-HTTP health), G4 (series store), G13 (the operation registry, REST serving, OpenAPI, per-person API keys: the first release's read endpoints need it); G6 and G12 may land here or with slice 2.
-- Libraries, in parallel and standalone: `lib-unifi` (official API, legacy fallback, capability probe, dry-run writes) and `lib-tailscale` (REST with OAuth, LocalAPI, read/write scope separation), each with recorded fixtures and the v4 CI set.
+- Libraries, in parallel and standalone, built as slothlet API packages (slothlet for composition, not rummage, no Digby): `lib-unifi` (official API, legacy fallback, capability probe, dry-run writes) and `lib-tailscale` (REST with OAuth, LocalAPI, read/write scope separation), each with recorded fixtures and the v4 CI set.
 - Digby: `digby-ext-wire` (§6.19) with unit, property and fuzz tests, standing alone; the app shell as a served app with the password fill and the claim; `rummage deploy` on scratch instances through rummage#719's harness.
 
 ### Slice 1 — the first release: mode 1, replacing Technitium
@@ -737,7 +775,7 @@ Acceptance: the compare report against Technitium shows no unexplained differenc
 
 ### Slice 2 — the network integrations
 
-`networks` (the orchestrator: driver contract and registry, IPAM, per-network DNS settings, the mode switch, LAN sharing, network checks), `networks-driver-unifi` (capabilities, networks, clients, fixed IPs, DHCP DNS settings, Forward Domain rules, opt-in writes), `networks-driver-tailscale` (devices owned and shared-in, DNS configuration, routes, policy; the checks with fix steps including "split routes answered"; the split route and LAN-sharing writes behind separate scopes), `machines` (devices from the orchestrator, shared-in naming, rename/hide; `quack.shellback.net` as the worked example), `health` complete (the admin to-do), the `localdomain` retirement, the slice-2 operations of §6.17 (the write operations through the record rules; the drivers' read operations), G5 roles if per-person accounts are wanted by then.
+`networks` (the orchestrator: driver contract and registry, IPAM, per-network DNS settings, the mode switch, LAN sharing, network checks), `networks-driver-unifi` (capabilities, networks, clients, fixed IPs, DHCP DNS settings, Forward Domain rules, opt-in writes; it calls `lib-unifi`'s `createUnifi` factory from its own leaves), `networks-driver-tailscale` (devices owned and shared-in, DNS configuration, routes, policy; the checks with fix steps including "split routes answered"; the split route and LAN-sharing writes behind separate scopes; it calls `lib-tailscale`'s `createTailscale` factory from its own leaves), `machines` (devices from the orchestrator, shared-in naming, rename/hide; `quack.shellback.net` as the worked example), `health` complete (the admin to-do), the `localdomain` retirement, the slice-2 operations of §6.17 (the write operations through the record rules; the drivers' read operations), G5 roles if per-person accounts are wanted by then.
 
 ### Slice 3 — certificates and encrypted transports
 
@@ -897,7 +935,7 @@ Numbers are stable across revisions. **Decided** items record the decision; item
 - **Q14** Raw query logs with client addresses: 7 days by default, admin-configurable; aggregates with their own configurable retention.
 - **Q15** The Tailscale OAuth client starts read-only; writes are a separate opt-in; shared-in devices get names under the tailnet view by the same rules; an admin can rename or hide any machine.
 - **Q16** One administrator with a password through rummage's password fill; per-person accounts later.
-- **Q18** `CLDMV/lib-route53` → `@cldmv/lib-route53`, a standalone library like the other two; `digby-ext-public-driver-route53` is the driver built on it, plugged into `public`; both land in slice 3 with the ACME DNS-01 writes (§6.2, §9).
+- **Q18** The integration libraries are **slothlet API packages** — slothlet for composition (`self`, context and lifecycle), not rummage, and no Digby; the driver extensions wrap them. Exposure is **decided**: standalone libraries, each exposing a factory (`createUnifi` / `createTailscale`) that composes the library's own slothlet instance over the package's `api/` and returns that api; credentials and config go in through the factory and stay inside the library's own instance — per-instance credential isolation, and the libraries stay usable by any project. No host-mount surface for now (no `api.add` manifest, no exported api dir). `CLDMV/lib-route53` → `@cldmv/lib-route53` stands with the other two; `digby-ext-public-driver-route53` is the driver built on it, plugged into `public`; both land in slice 3 with the ACME DNS-01 writes (§6.2, §9).
 - **Q17** No interim hand-written unit; privileged ports, hardening and the related deploy needs go into rummage#717 (G3); Digby waits.
 - **Q19** The UniFi API key (and a local account for the legacy fallback) is created when the integration slice is built; the Network application's version and the Forward Domain checks stay Phase 0 steps (§10 step 2).
 - **Q21** No public record for `quack.shellback.net`: Quack on `llm-server` is reachable only through the shared tailnet; Digby answers it in the `tailnet` view with the address this tailnet sees, the split route stays, and the sharer's side resolves it inside their own tailnet (§4.15).
@@ -913,6 +951,7 @@ Numbers are stable across revisions. **Decided** items record the decision; item
 
 ### Open: facts to confirm
 
+- Whether `unifi-cli` later becomes a thin CLI on top of `lib-unifi`, dropping its own copy of the legacy API code (§6.2) — undecided.
 - Whether Route 53 hosts the zones the relay's per-org names live in (the per-org domains certbot fronts on the relay VPS, §6.18, §11). `ics.cldmv.net` itself sits inside `cldmv.net`, which Route 53 already hosts (Q3 plans that zone's DNSSEC signing there), so it is not part of the question; the §6.18 assumption that the relay's ACME DNS-01 writes are Route 53 challenge writes (#46's per-name placement) depends on the per-org zones. If they sit with another provider, the relay's driver is that provider's instead. Until it is confirmed, the relay slice also needs the per-org name list off the relay's certbot configuration.
 
 ### Defaults — not yet confirmed
